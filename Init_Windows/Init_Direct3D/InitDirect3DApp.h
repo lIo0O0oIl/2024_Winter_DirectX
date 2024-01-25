@@ -3,6 +3,7 @@
 #include "D3dApp.h"
 #include <DirectXColors.h>
 #include "../Common//MathHelper.h"
+#include "../Common//GeometryGenerator.h"
 
 using namespace DirectX;
 
@@ -10,13 +11,81 @@ using namespace DirectX;
 struct Vertex 
 {
 	XMFLOAT3 Pos;
-	XMFLOAT4 Color;
+	XMFLOAT3 Normal;
 };
 
-// 오브젝트 상수 버퍼
+// 개별 오브젝트 상수 버퍼 (오브젝트 갯수만큼)
 struct ObjectConstants
 {
-	XMFLOAT4X4 WorldViewProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 World = MathHelper::Identity4x4();
+};
+
+// 개별 재질 상수 버퍼
+struct MaterialsConstants
+{
+	XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
+	XMFLOAT3 FresnelIR0 = { 0.01f, 0.01f, 0.01f };
+	float Roughness = 0.25f;
+};
+
+// 공용 상수 버퍼 (하나만 존재함.)
+struct PassConstants
+{
+	XMFLOAT4X4 View = MathHelper::Identity4x4();
+	XMFLOAT4X4 InvView = MathHelper::Identity4x4();		// 카메라, 인벌스 카메라
+	XMFLOAT4X4 Proj = MathHelper::Identity4x4();
+	XMFLOAT4X4 InvProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 ViewProj = MathHelper::Identity4x4();		// 투영
+};
+
+// 기하도형 정보
+struct GeometryInfo
+{
+	std::string Name;
+
+	// 정점 버퍼 뷰
+	D3D12_VERTEX_BUFFER_VIEW						VertexBufferView = {};
+	ComPtr<ID3D12Resource>								VertexBuffer = nullptr;
+
+	// 인덱스 버퍼 뷰
+	D3D12_INDEX_BUFFER_VIEW							IndexBufferView = {};
+	ComPtr<ID3D12Resource>								IndexBuffer = nullptr;
+
+	// 정점 갯수
+	int VertexCount = 0;
+
+	// 인덱스 갯수
+	int IndexCount = 0;
+};
+
+// 재징 정보
+struct MaterialInfo
+{
+	std::string Name;
+
+	int MatCBIndex = -1;
+	int DiffuseSrvHeapIndex = -1;
+	int Texture_On = 0;
+
+	XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
+	XMFLOAT3 FresnelR0 = { 0.01f, 0.01f, 0.01f };		// 굴절률
+	float Roughness = 0.25f;		// 거칠기
+};
+
+// 렌더링할 오브젝트 구조체
+struct RenderItem
+{
+	RenderItem() = default;
+
+	UINT ObjCBIndex = -1;
+
+	XMFLOAT4X4 World = MathHelper::Identity4x4();
+	D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+	GeometryInfo* Geo = nullptr;
+	MaterialInfo* Mat = nullptr;
+
+	int IndexCount = 0;
 };
 
 class InitDirect3DApp : public D3DApp
@@ -29,9 +98,16 @@ public:
 
 private:
 	virtual void OnResize()override;
+
 	virtual void Update(const GameTimer& gt)override;
+	void UpdateCamera(const GameTimer& gt);
+	void UpdateObjectCB(const GameTimer& gt);
+	void UpdateMaterialCB(const GameTimer& gt);
+	void UpdatePassCB(const GameTimer& gt);
+
 	virtual void DrawBegin(const GameTimer& gt)override;
 	virtual void Draw(const GameTimer& gt)override;
+	void DrawRenderItems();
 	virtual void DrawEnd(const GameTimer& gt)override;
 
 	virtual void OnMouseDown(WPARAM btnState, int x, int y) override;
@@ -41,6 +117,13 @@ private:
 private:
 	void BuildInputLayout();
 	void BuildGeometry();
+	void BuildBoxGeometry();
+	void BuildGridGeometry();
+	void BuildSphereGeometry();
+	void BildCylinderGeometry();
+	void BuildSkullGeometry();
+	void BuildMaterials();
+	void BuildRenderItem();
 	void BuildShader();
 	void BuildConstantBuffer();
 	void BuildRootSignature();		// 내가 렌러딩 파이프라인 할 때 시그니쳐 만들어주기 후에 렌더링파이프라인 묶어줘야함.
@@ -56,30 +139,35 @@ private:
 	// 파이프라인 상태 객체
 	ComPtr<ID3D12PipelineState>						mPSO = nullptr;
 
-	// 정점 버퍼 뷰
-	D3D12_VERTEX_BUFFER_VIEW						VertexBufferView = {};
-	ComPtr<ID3D12Resource>								VertexBuffer = nullptr;
-
-	// 인덱스 버퍼 뷰
-	D3D12_INDEX_BUFFER_VIEW							IndexBufferView = {};
-	ComPtr<ID3D12Resource>								IndexBuffer = nullptr;
-
-	// 정점 갯수
-	int VertexCount = 0;
-
-	// 인덱스 갯수
-	int IndexCount = 0;
-
 	// 정점 쉐이더와 픽셀 쉐이더
 	ComPtr<ID3DBlob> mVSByteCode = nullptr;
 	ComPtr<ID3DBlob> mPSByteCode = nullptr;
 
-	// 오브젝트 상수 버퍼
+	// 개별 오브젝트 상수 버퍼
 	ComPtr<ID3D12Resource> mObjectCB = nullptr;
 	BYTE* mObjectMappedData = nullptr;
 	UINT mObjectByteSize = 0;
 
-	// 월드 / 시야 / 투영 행렬
+	// 개별 재질 상수 버퍼
+	ComPtr<ID3D12Resource> mMaterialCB = nullptr;
+	BYTE* mMaterialMappedData = nullptr;
+	UINT mMaterialByteSize = 0;
+
+	// 공용 상수 버퍼
+	ComPtr<ID3D12Resource> mPassCB = nullptr;
+	BYTE* mPassMappedData = nullptr;
+	UINT mPassByteSize = 0;
+
+	// 기하 구조 맵
+	std::unordered_map<std::string, std::unique_ptr<GeometryInfo>> mGeometries;
+
+	// 재질 맵
+	std::unordered_map<std::string, std::unique_ptr<MaterialInfo>> mMaterials;
+
+	// 렌더링할 오브젝트 리스트
+	std::vector<std::unique_ptr<RenderItem>> mRenderItems;
+
+	// 월드 / 시야(카메라) / 투영 행렬
 	XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
 	XMFLOAT4X4 mView = MathHelper::Identity4x4();
 	XMFLOAT4X4 mProj = MathHelper::Identity4x4();
@@ -90,5 +178,5 @@ private:
 	float mRadius = 5.0f;
 
 	// 마우스 좌표
-	POINT mLastMovesPos = { 0, 0 };
+	POINT mLastMousePos = { 0, 0 };
 };

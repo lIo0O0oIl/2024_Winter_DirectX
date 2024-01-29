@@ -64,10 +64,11 @@ public:
 	// Strafe/Walk the camera a distance d.
 	void Strafe(float d);
 	void Walk(float d);
+	void UpAndDown(float d);
 
 	// Rotate the camera.
-	void Pitch(float angle);
-	void RotateY(float angle);
+	void Pitch(float angle);			// 뭐 여기가 x 축 회전?
+	void RotateY(float angle);		// 여기가 Y 회전? 축 회전이라고 하네여
 
 	// After modifying camera position/orientation, call to rebuild the view matrix.
 	void UpdateViewMatrix();

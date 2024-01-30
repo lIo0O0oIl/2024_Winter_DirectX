@@ -150,6 +150,7 @@
     <ClInclude Include="..\Common\MathHelper.h" />
     <ClInclude Include="D3DApp.h" />
     <ClInclude Include="InitDirect3DApp.h" />
+    <ClInclude Include="ShadowMap.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Common\Camera.cpp" />
@@ -160,6 +161,7 @@
     <ClCompile Include="..\Common\MathHelper.cpp" />
     <ClCompile Include="D3DApp.cpp" />
     <ClCompile Include="InitDirect3DApp.cpp" />
+    <ClCompile Include="ShadowMap.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Color.hlsl">
@@ -178,6 +180,16 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Skybox.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shadows.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ShadowDebug.hlsl">
       <FileType>Document</FileType>
     </None>
   </ItemGroup>

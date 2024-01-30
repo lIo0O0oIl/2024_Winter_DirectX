@@ -15,7 +15,8 @@ struct VertexIn
 struct VertexOut
 {
 	float4 PosH : SV_POSITION;
-	float3 PosW : POSITION;
+	float4 ShadowPosH : POSITION0;
+	float3 PosW : POSITION1;
 	float3 NormalW : NORMAL;
 	float3 TangentW : TANGENT;
 	float2 Uv : TEXCOORD;
@@ -28,6 +29,8 @@ VertexOut VS(VertexIn vin)
 	float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
 	vout.PosW = posW.xyz;
 	vout.PosH = mul(posW, gViewProj);
+
+	vout.ShadowPosH = mul(posW, gShadowTransform);
 
 	vout.NormalW = mul(vin.NormalL, (float3x3)gWorld);
 
@@ -68,7 +71,9 @@ float4 PS(VertexOut pin) : SV_Target
 		bumpedNormalW = NormalSampleToWorldSpace(normalMapSample.rgb, pin.NormalW, pin.TangentW);
 	}
 
-	float directLight = ComputeLighting(gLights, gLightCount, mat, pin.PosW, bumpedNormalW, toEyeW);
+	// shadow mappint
+	float shadowFactor = CalcShadowFactor(pin.ShadowPosH);
+	float directLight = ComputeLighting(gLights, gLightCount, mat, pin.PosW, bumpedNormalW, toEyeW, shadowFactor);
 	
 	float4 litColor = ambient + directLight;
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "D3dApp.h"
+#include "ShadowMap.h"
 #include <DirectXColors.h>
 #include "../Common/Camera.h"
 #include "../Common//MathHelper.h"
@@ -17,6 +18,7 @@ enum class RenderLayer : int
 	Opaque = 0,
 	Transparent,
 	AlphaTested,
+	Debug,
 	Skybox,
 	Count
 };
@@ -69,6 +71,8 @@ struct PassConstants
 	XMFLOAT4X4 Proj = MathHelper::Identity4x4();
 	XMFLOAT4X4 InvProj = MathHelper::Identity4x4();
 	XMFLOAT4X4 ViewProj = MathHelper::Identity4x4();		// 투영
+	XMFLOAT4X4 InvViewProj = MathHelper::Identity4x4();		// 인벌스
+	XMFLOAT4X4 ShadowTransform = MathHelper::Identity4x4();
 
 	XMFLOAT4 AmbientLight = { 0.0f, 0.0f, 0.0f, 1.0f };		// 환경광
 	XMFLOAT3 EyePosW{ 0.0f, 0.0f, 0.0f };		// 카메라 위치
@@ -153,16 +157,20 @@ public:
 	virtual bool Initialize()override;
 
 private:
+	void CreateDsvDescriptorHeaps()override;        // 뎁스텐실버퍼
 	virtual void OnResize()override;
 
 	virtual void Update(const GameTimer& gt)override;
+	void UpdateLight(const GameTimer& gt);
 	void UpdateCamera(const GameTimer& gt);
 	void UpdateObjectCB(const GameTimer& gt);
 	void UpdateMaterialCB(const GameTimer& gt);
 	void UpdatePassCB(const GameTimer& gt);
+	void UpdateShadowCB(const GameTimer& gt);
 
 	virtual void DrawBegin(const GameTimer& gt)override;
 	virtual void Draw(const GameTimer& gt)override;
+	void DrawSceneToShadowMap();
 	void DrawRenderItems(const std::vector<RenderItem*>& ritems);
 	virtual void DrawEnd(const GameTimer& gt)override;
 
@@ -176,6 +184,7 @@ private:
 	void BuildGeometry();
 	void BuildBoxGeometry();
 	void BuildGridGeometry();
+	void BuildQuadGeometry();
 	void BuildSphereGeometry();
 	void BildCylinderGeometry();
 	void BuildSkullGeometry();
@@ -220,6 +229,9 @@ private:
 	// 스카이박스 텍스쳐 서술자 힙 인덱스
 	UINT mSkyTexHeapIndex = -1;
 
+	// 그림자 맵 서술자 힙 인덱스
+	UINT mShadowMapHeapIndex = -1;
+
 	// 서술자 힙
 	ComPtr<ID3D12DescriptorHeap> mSrvDescriptorHeap = nullptr;
 
@@ -238,10 +250,28 @@ private:
 	// 렌더링할 오브젝트 나누기 : PSO
 	std::vector<RenderItem*> mRenderItemLayer[(int)RenderLayer::Count];
 
+	// 그림자 맵
+	std::unique_ptr<ShadowMap> mShadowMap;		// COmPtr 은 다렉 전용임. 일반은 저런거 써야함.
+
 	// 카메라 클래스
 	Camera mCamera;
-
 	float mCameraSpeed = 10.0f;
+
+	// 경계 구, 깊이값을 넓혀주는 작업, 중심을 기준으로 공전하듯.
+	BoundingSphere mSceneBound;
+
+	// 라이트 행렬
+	float mLightRotationAngle = 0.0f;
+	float mLightRotationSpeed = 0.1f;
+	XMFLOAT3 mBaseLightDirection = XMFLOAT3(0.57735f, -0.57735f, 0.57735f);
+	XMFLOAT3 mRotatedLightDirection;
+
+	float mLightNearZ = 0.0f;
+	float mLightFarZ = 0.0f;
+	XMFLOAT3 mLightPosW;
+	XMFLOAT4X4 mLightView = MathHelper::Identity4x4();
+	XMFLOAT4X4 mLightProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 mShadowTransform = MathHelper::Identity4x4();
 
 	// 마우스 좌표
 	POINT mLastMousePos = { 0, 0 };

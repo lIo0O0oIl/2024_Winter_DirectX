@@ -39,6 +39,7 @@ public:
     virtual LRESULT MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);     // 메세지 처리
 
 protected:
+    virtual void CreateDsvDescriptorHeaps();        // 뎁스텐실버퍼
     virtual void OnResize();
     virtual void Update(const GameTimer& gt) = 0;       // 추상화 해둔 것.
     virtual void DrawBegin(const GameTimer& gt) = 0;
@@ -63,7 +64,6 @@ protected:
     void CreateCommandFence();      // 팬스, 기다릴 때
     void CreateDescriptorSize();        // 서술자
     void CreateRtvDescriptorHeaps();        // 랜터타입버퍼 힙에 서술자가 들어가 있음.
-    void CreateDsvDescriptorHeaps();        // 뎁스텐실버퍼
     void CreateViewPort();      // 뷰포트 생성
 
 protected:

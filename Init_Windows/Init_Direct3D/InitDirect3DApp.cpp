@@ -40,6 +40,13 @@ bool InitDirect3DApp::Initialize()
     // 초기화 명령들을 준비하기 위해 명령 목록 재설정
     ThrowIfFailed(mCommandList->Reset(mCommandListAlloc.Get(), nullptr));
 
+    // 그림자 맵 구축
+    mShadowMap = std::make_unique<ShadowMap>(md3dDevice.Get(), 2048, 2048);
+
+    // 경계구 셋팅
+    mSceneBound.Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    mSceneBound.Radius = sqrtf(10.0f * 10.0f + 15.0f * 15.0f);
+
     // 카메라 셋팅
     mCamera.SetPosition(0.0f, 2.0f, -15.0f);
 
@@ -66,6 +73,51 @@ bool InitDirect3DApp::Initialize()
     return true;
 }
 
+void InitDirect3DApp::CreateDsvDescriptorHeaps()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc;
+    dsvHeapDesc.NumDescriptors = 2;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    dsvHeapDesc.NodeMask = 0;
+    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(mDsvHeap.GetAddressOf())));
+
+    D3D12_RESOURCE_DESC depthStencilDesc;
+    depthStencilDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depthStencilDesc.Alignment = 0;
+    depthStencilDesc.Width = mClientWidth;
+    depthStencilDesc.Height = mClientHeight;
+    depthStencilDesc.DepthOrArraySize = 1;
+    depthStencilDesc.MipLevels = 1;
+    depthStencilDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    depthStencilDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
+    depthStencilDesc.SampleDesc.Quality = m4xMsaaQuality ? (m4xMsaaQuality - 1) : 0;
+    depthStencilDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    depthStencilDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE optClear;
+    optClear.Format = mDepthStencilFormat;
+    optClear.DepthStencil.Depth = 1.0f;
+    optClear.DepthStencil.Stencil = 0;
+
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &depthStencilDesc,
+        D3D12_RESOURCE_STATE_COMMON,
+        &optClear,
+        IID_PPV_ARGS(mDepthStencilBuffer.GetAddressOf())));
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Format = mDepthStencilFormat;
+    dsvDesc.Texture2D.MipSlice = 0;
+
+    mDepthStencileView = mDsvHeap->GetCPUDescriptorHandleForHeapStart();
+    md3dDevice->CreateDepthStencilView(mDepthStencilBuffer.Get(), &dsvDesc, mDepthStencileView);
+}
+
 void InitDirect3DApp::OnResize()
 {
     D3DApp::OnResize();
@@ -76,10 +128,54 @@ void InitDirect3DApp::OnResize()
 
 void InitDirect3DApp::Update(const GameTimer& gt)
 {
+    UpdateLight(gt);
     UpdateCamera(gt);
     UpdateObjectCB(gt);
     UpdateMaterialCB(gt);
     UpdatePassCB(gt);
+    UpdateShadowCB(gt);
+}
+
+void InitDirect3DApp::UpdateLight(const GameTimer& gt)
+{
+    mLightRotationAngle += mLightRotationSpeed * gt.DeltaTime();
+
+    XMMATRIX R = XMMatrixRotationY(mLightRotationAngle);
+    XMVECTOR lightDir = XMLoadFloat3(&mBaseLightDirection);
+    lightDir = XMVector3TransformNormal(lightDir, R);
+    XMStoreFloat3(&mRotatedLightDirection, lightDir);
+
+    XMVECTOR lightPos = -2.0f * lightDir * mSceneBound.Radius;
+    XMVECTOR targetPos = XMLoadFloat3(&mSceneBound.Center);
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    XMMATRIX lightView = XMMatrixLookAtLH(lightPos, targetPos, lightUp);        // view 만들기
+
+    XMFLOAT3 sphereCenterLs;     // 투영행렬을 만들기 위한 프로스텀? 만들기
+    XMStoreFloat3(&sphereCenterLs, XMVector3TransformCoord(targetPos, lightView));
+
+    float l = sphereCenterLs.x - mSceneBound.Radius;        // left
+    float r = sphereCenterLs.x + mSceneBound.Radius;        // right
+    float b = sphereCenterLs.y - mSceneBound.Radius;        // bottom
+    float t = sphereCenterLs.y + mSceneBound.Radius;        // top
+    float n = sphereCenterLs.z - mSceneBound.Radius;        // near
+    float f = sphereCenterLs.z + mSceneBound.Radius;        // far
+
+    mLightNearZ = n;
+    mLightFarZ = f;
+    XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(l, r, b, t, n, f);
+
+    // NDC space [-1, +1]^2 to Texture space [0, 1]^2
+    XMMATRIX T(
+        0.5f, 0.0f, 0.0f, 0.0f,
+        0.0f, -0.5f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.5f, 0.5f, 0.0f, 1.0f);
+
+    XMMATRIX S = lightView * lightProj * T;
+    XMStoreFloat3(&mLightPosW, lightPos);
+    XMStoreFloat4x4(&mLightView, lightView);
+    XMStoreFloat4x4(&mLightProj, lightProj);
+    XMStoreFloat4x4(&mShadowTransform, S);      // Light 기준으로 행렬 만들어서 
 }
 
 void InitDirect3DApp::UpdateCamera(const GameTimer& gt)
@@ -154,19 +250,23 @@ void InitDirect3DApp::UpdatePassCB(const GameTimer& gt)
     XMMATRIX invView = XMMatrixInverse(&XMMatrixDeterminant(view), view);
     XMMATRIX invProj = XMMatrixInverse(&XMMatrixDeterminant(proj), proj);
     XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+    XMMATRIX invViewProj = XMMatrixInverse(&XMMatrixDeterminant(viewProj), viewProj);
+    XMMATRIX shadowTransform = XMLoadFloat4x4(&mShadowTransform);
 
     XMStoreFloat4x4(&mainPass.View, XMMatrixTranspose(view));
     XMStoreFloat4x4(&mainPass.InvView, XMMatrixTranspose(invView));
     XMStoreFloat4x4(&mainPass.Proj, XMMatrixTranspose(proj));
     XMStoreFloat4x4(&mainPass.InvProj, XMMatrixTranspose(invProj));
     XMStoreFloat4x4(&mainPass.ViewProj, XMMatrixTranspose(viewProj));
+    XMStoreFloat4x4(&mainPass.InvViewProj, XMMatrixTranspose(invViewProj));
+    XMStoreFloat4x4(&mainPass.ShadowTransform, XMMatrixTranspose(shadowTransform));
 
     mainPass.AmbientLight = { 0.25f, 0.25f, 0.35f, 1.0f };
     mainPass.EyePosW = mCamera.GetPosition3f();
     mainPass.LightCount = 11;
 
     mainPass.Lights[0].LightType = 0;       // 디렉셔널 라이트
-    mainPass.Lights[0].Direction = { 0.57735f, -0.57735f, 0.57735f };
+    mainPass.Lights[0].Direction = mRotatedLightDirection/*{ 0.57735f, -0.57735f, 0.57735f }*/;         // 빙글게 빌글게 돌려주기
     mainPass.Lights[0].Strengh = { 0.6f, 0.6f, 0.6f };
 
     for (int i = 0; i < 5; ++i)
@@ -190,11 +290,49 @@ void InitDirect3DApp::UpdatePassCB(const GameTimer& gt)
     memcpy(&mPassMappedData[0], &mainPass, sizeof(PassConstants));      // PassConstants의 크기 만큼 복사해줌.
 }
 
+void InitDirect3DApp::UpdateShadowCB(const GameTimer& gt)
+{
+    PassConstants mainPass;
+    XMMATRIX view = XMLoadFloat4x4(&mLightView);
+    XMMATRIX proj = XMLoadFloat4x4(&mLightProj);
+
+    XMMATRIX invView = XMMatrixInverse(&XMMatrixDeterminant(view), view);
+    XMMATRIX invProj = XMMatrixInverse(&XMMatrixDeterminant(proj), proj);
+    XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+    XMMATRIX invViewProj = XMMatrixInverse(&XMMatrixDeterminant(viewProj), viewProj);
+
+    XMStoreFloat4x4(&mainPass.View, XMMatrixTranspose(view));
+    XMStoreFloat4x4(&mainPass.InvView, XMMatrixTranspose(invView));
+    XMStoreFloat4x4(&mainPass.Proj, XMMatrixTranspose(proj));
+    XMStoreFloat4x4(&mainPass.InvProj, XMMatrixTranspose(invProj));
+    XMStoreFloat4x4(&mainPass.ViewProj, XMMatrixTranspose(viewProj));
+    XMStoreFloat4x4(&mainPass.InvViewProj, XMMatrixTranspose(invViewProj));
+    mainPass.EyePosW = mLightPosW;
+
+    UINT passCBByteSize = (sizeof(PassConstants) + 255) & ~255;
+    memcpy(&mPassMappedData[passCBByteSize], &mainPass, sizeof(PassConstants));
+}
+
 void InitDirect3DApp::DrawBegin(const GameTimer& gt)        // 그리는 데 필요한 기본 셋팅들
 {
     ThrowIfFailed(mCommandListAlloc->Reset());
 
     ThrowIfFailed(mCommandList->Reset(mCommandListAlloc.Get(), nullptr));
+}
+
+void InitDirect3DApp::Draw(const GameTimer& gt)     // GPU 에 보낼 명령 정리해서 쌓음
+{
+    // 루트 시그니처 바인딩
+    mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+    // 서술자 렌더링 파잉프라인 바인딩
+    ID3D12DescriptorHeap* descriptorHeap[] = { mSrvDescriptorHeap.Get() };
+    mCommandList->SetDescriptorHeaps(_countof(descriptorHeap), descriptorHeap);     // 서술자 렌더링 파이프라인에 에 묶어주기
+
+    // 1Pass : 그림자 맵 그리기
+    DrawSceneToShadowMap();
+
+    // 2Pass : 오브젝트 렌더링에 그림자맵 더하기
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
@@ -205,19 +343,6 @@ void InitDirect3DApp::DrawBegin(const GameTimer& gt)        // 그리는 데 필요한 
     mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 
     mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
-}
-
-void InitDirect3DApp::Draw(const GameTimer& gt)     // GPU 에 보낼 명령 정리해서 쌓음
-{
-    // 렌더링 파이프라인 설정
-    mCommandList->SetPipelineState(mPSOs["opaque"].Get());
-
-    // 루트 시그니처 바인딩
-    mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-
-    // 서술자 렌더링 파잉프라인 바인딩
-    ID3D12DescriptorHeap* descriptorHeap[] = { mSrvDescriptorHeap.Get() };
-    mCommandList->SetDescriptorHeaps(_countof(descriptorHeap), descriptorHeap);     // 서술자 렌더링 파이프라인에 에 묶어주기
 
     // 공용 상수 버퍼 바인딩
     D3D12_GPU_VIRTUAL_ADDRESS passCBAddress = mPassCB->GetGPUVirtualAddress();
@@ -228,6 +353,13 @@ void InitDirect3DApp::Draw(const GameTimer& gt)     // GPU 에 보낼 명령 정리해서
     skyTexDescriptor.Offset(mSkyTexHeapIndex, mCbvSrvUavDescriptorSize);    // 설정된거만큼 움직임
     mCommandList->SetGraphicsRootDescriptorTable(3, skyTexDescriptor);
 
+    // 그림자 맵 텍스쳐 버퍼 바인딩
+    CD3DX12_GPU_DESCRIPTOR_HANDLE shadowTexDescriptor(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    shadowTexDescriptor.Offset(mShadowMapHeapIndex, mCbvSrvUavDescriptorSize);    // 설정된거만큼 움직임
+    mCommandList->SetGraphicsRootDescriptorTable(6, shadowTexDescriptor);
+
+    // 렌더링 파이프라인 설정
+    mCommandList->SetPipelineState(mPSOs["opaque"].Get());
     DrawRenderItems(mRenderItemLayer[(int)RenderLayer::Opaque]);
 
     mCommandList->SetPipelineState(mPSOs["alphaTested"].Get());
@@ -236,8 +368,38 @@ void InitDirect3DApp::Draw(const GameTimer& gt)     // GPU 에 보낼 명령 정리해서
     mCommandList->SetPipelineState(mPSOs["transparent"].Get());
     DrawRenderItems(mRenderItemLayer[(int)RenderLayer::Transparent]);
 
+    mCommandList->SetPipelineState(mPSOs["debug"].Get());
+    DrawRenderItems(mRenderItemLayer[(int)RenderLayer::Debug]);
+
     mCommandList->SetPipelineState(mPSOs["skybox"].Get());
     DrawRenderItems(mRenderItemLayer[(int)RenderLayer::Skybox]);
+}
+
+void InitDirect3DApp::DrawSceneToShadowMap()
+{
+    mCommandList->RSSetViewports(1, &mShadowMap->Viewport());
+    mCommandList->RSSetScissorRects(1, &mShadowMap->ScissorRect());     // 렌더링 할 영역 설정
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap->Resource(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE));     // 1개의 울타리 설치
+
+    mCommandList->ClearDepthStencilView(mShadowMap->Dsv(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+        1.0f, 0, 0, nullptr);      // 초기화
+
+    mCommandList->OMSetRenderTargets(0, nullptr, false, &mShadowMap->Dsv());        // 랜더 타겟이 없으니까 다 깊이 값만 저장됨.
+
+    // 그림자 맵 공용 상수 버퍼 설정
+    UINT passCBByteSize = (sizeof(PassConstants) + 255) & ~255;
+    D3D12_GPU_VIRTUAL_ADDRESS passCBAddrees = mPassCB->GetGPUVirtualAddress() + passCBByteSize;
+    mCommandList->SetGraphicsRootConstantBufferView(2, passCBAddrees);
+
+    mCommandList->SetPipelineState(mPSOs["shadow"].Get());
+    DrawRenderItems(mRenderItemLayer[(int)RenderLayer::Opaque]);
+
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap->Resource(),
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_GENERIC_READ));
 }
 
 void InitDirect3DApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
@@ -347,6 +509,7 @@ void InitDirect3DApp::BuildGeometry()
 {
     BuildBoxGeometry();
     BuildGridGeometry();
+    BuildQuadGeometry();
     BuildSphereGeometry();
     BildCylinderGeometry();
     BuildSkullGeometry();
@@ -444,6 +607,79 @@ void InitDirect3DApp::BuildGridGeometry()
 
     auto geo = std::make_unique<GeometryInfo>();
     geo->Name = "Grid";
+
+    // 정점 버퍼 만들기
+    geo->VertexCount = (UINT)vertices.size();
+    const UINT vbByteSize = geo->VertexCount * sizeof(Vertex);
+
+    D3D12_HEAP_PROPERTIES heapProperty = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);    // 힙 프로퍼티
+    D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(vbByteSize);
+
+    md3dDevice->CreateCommittedResource(
+        &heapProperty,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&geo->VertexBuffer));
+
+    void* vertexDataBuffer = nullptr;
+    CD3DX12_RANGE vertexRange(0, 0);
+    geo->VertexBuffer->Map(0, &vertexRange, &vertexDataBuffer);
+    memcpy(vertexDataBuffer, vertices.data(), vbByteSize);
+    geo->VertexBuffer->Unmap(0, nullptr);
+
+    geo->VertexBufferView.BufferLocation = geo->VertexBuffer->GetGPUVirtualAddress();
+    geo->VertexBufferView.StrideInBytes = sizeof(Vertex);
+    geo->VertexBufferView.SizeInBytes = vbByteSize;
+
+    // 인덱스 버퍼 만들기
+    geo->IndexCount = (UINT)indices.size();
+    const UINT ibByteSize = geo->IndexCount * sizeof(std::uint16_t);
+
+    heapProperty = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    desc = CD3DX12_RESOURCE_DESC::Buffer(ibByteSize);
+
+    md3dDevice->CreateCommittedResource(
+        &heapProperty,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&geo->IndexBuffer));
+
+    void* indexDataBuffer = nullptr;
+    CD3DX12_RANGE indexRange(0, 0);
+    geo->IndexBuffer->Map(0, &indexRange, &indexDataBuffer);
+    memcpy(indexDataBuffer, indices.data(), ibByteSize);
+    geo->IndexBuffer->Unmap(0, nullptr);
+
+    geo->IndexBufferView.BufferLocation = geo->IndexBuffer->GetGPUVirtualAddress();
+    geo->IndexBufferView.Format = DXGI_FORMAT_R16_UINT;
+    geo->IndexBufferView.SizeInBytes = ibByteSize;
+
+    mGeometries[geo->Name] = std::move(geo);        // 만들어둔 데이터 옮기기
+}
+
+void InitDirect3DApp::BuildQuadGeometry()
+{
+    GeometryGenerator geoGen;
+    GeometryGenerator::MeshData quad = geoGen.CreateQuad(0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+
+    std::vector<Vertex> vertices(quad.Vertices.size());      // 정점
+    for (UINT i = 0; i < quad.Vertices.size(); ++i)
+    {
+        vertices[i].Pos = quad.Vertices[i].Position;
+        vertices[i].Normal = quad.Vertices[i].Normal;
+        vertices[i].Uv = quad.Vertices[i].TexC;
+        vertices[i].Tangent = quad.Vertices[i].TangentU;
+    }
+
+    std::vector<std::uint16_t> indices;     // 인덱스
+    indices.insert(indices.end(), std::begin(quad.GetIndices16()), std::end(quad.GetIndices16()));        // 한번에 다 넣어줌.
+
+    auto geo = std::make_unique<GeometryInfo>();
+    geo->Name = "Quad";
 
     // 정점 버퍼 만들기
     geo->VertexCount = (UINT)vertices.size();
@@ -841,7 +1077,7 @@ void InitDirect3DApp::BuildMaterials()
     auto skull = std::make_unique<MaterialInfo>();
     skull->Name = "Skull";
     skull->MatCBIndex = indexCount++;
-    skull->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
+    skull->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
     skull->FresnelR0 = XMFLOAT3(0.05f, 0.05f, 0.05f);
     skull->Roughness = 0.3f;
     mMaterials[skull->Name] = std::move(skull);
@@ -918,6 +1154,18 @@ void InitDirect3DApp::BuildRenderItem()
     mRenderItemLayer[(int)RenderLayer::Skybox].push_back(skyItem.get());        // 컬링하면 안됌. 안쪽에서 보여야 해용.
     mRenderItems.push_back(std::move(skyItem));
 
+    // 쿼드
+    auto quadItem = std::make_unique<RenderItem>();
+    quadItem->ObjCBIndex = objCBIndex++;
+    quadItem->World = MathHelper::Identity4x4();
+    quadItem->TexTransform = MathHelper::Identity4x4();
+    quadItem->Geo = mGeometries["Quad"].get();
+    quadItem->Mat = mMaterials["Tile"].get();
+    quadItem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    quadItem->IndexCount = quadItem->Geo->IndexCount;
+    mRenderItemLayer[(int)RenderLayer::Debug].push_back(quadItem.get());        // 디버그용으로 사용할거임.
+    mRenderItems.push_back(std::move(quadItem));
+
     // 바닥
     auto gridItem = std::make_unique<RenderItem>();
     gridItem->ObjCBIndex = objCBIndex++;
@@ -950,7 +1198,7 @@ void InitDirect3DApp::BuildRenderItem()
     skullItem->Mat = mMaterials["Skull"].get();
     skullItem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     skullItem->IndexCount = skullItem->Geo->IndexCount;
-    mRenderItemLayer[(int)RenderLayer::Transparent].push_back(skullItem.get());
+    mRenderItemLayer[(int)RenderLayer::Opaque].push_back(skullItem.get());
     mRenderItems.push_back(std::move(skullItem));
 
     for (int i = 0; i < 5; ++i) 
@@ -1033,6 +1281,12 @@ void InitDirect3DApp::BuildShader()
 
     mShaders["skyVS"] = d3dUtil::CompileShader(L"Skybox.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["skyPS"] = d3dUtil::CompileShader(L"Skybox.hlsl", nullptr, "PS", "ps_5_1");
+
+    mShaders["shadowVS"] = d3dUtil::CompileShader(L"Shadows.hlsl", nullptr, "VS", "vs_5_0");
+    mShaders["shadowPS"] = d3dUtil::CompileShader(L"Shadows.hlsl", nullptr, "PS", "ps_5_0");
+
+    mShaders["debugVS"] = d3dUtil::CompileShader(L"ShadowDebug.hlsl", nullptr, "VS", "vs_5_0");
+    mShaders["debugPS"] = d3dUtil::CompileShader(L"ShadowDebug.hlsl", nullptr, "PS", "ps_5_0");
 }
 
 void InitDirect3DApp::BuildConstantBuffer()
@@ -1073,7 +1327,7 @@ void InitDirect3DApp::BuildConstantBuffer()
 
     // 공용 상수 버퍼
     size = sizeof(PassConstants);
-    mPassByteSize = (size + 255) & ~255;            // 256의 배숫값. 257이면 512가 됨.
+    mPassByteSize = ((size + 255) & ~255) * 2;            // 256의 배숫값. 257이면 512가 됨.
     heapProperty = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
     desc = CD3DX12_RESOURCE_DESC::Buffer(mPassByteSize);
 
@@ -1092,7 +1346,7 @@ void InitDirect3DApp::BuildDescriptorHeaps()
 {
     // SRV heap 만들기
     D3D12_DESCRIPTOR_HEAP_DESC srcHeapDesc = {};
-    srcHeapDesc.NumDescriptors = mTextures.size();
+    srcHeapDesc.NumDescriptors = mTextures.size() + 1;      // + 1 : 그림자맵의 수
     srcHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srcHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;      // 이 힙이 보여야 함.
     ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srcHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
@@ -1129,6 +1383,18 @@ void InitDirect3DApp::BuildDescriptorHeaps()
         }
         md3dDevice->CreateShaderResourceView(texResource.Get(), &srvDesc, hDescriptor);
     }
+
+    mShadowMapHeapIndex = (UINT)mTextures.size();       // 사이즈만큼해서 가장 아래에 해줌.
+
+    auto srvCpuStart = mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    auto srvGpuStart = mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    auto dsvCpuStart = mDsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    mShadowMap->BuildDescriptors(
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(srvCpuStart, mShadowMapHeapIndex, mCbvSrvUavDescriptorSize),
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(srvGpuStart, mShadowMapHeapIndex, mCbvSrvUavDescriptorSize),
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(dsvCpuStart, 1, mDsvDescriptorSize));
+
 }
 
 void InitDirect3DApp::BuildRootSignature()
@@ -1148,16 +1414,41 @@ void InitDirect3DApp::BuildRootSignature()
         CD3DX12_DESCRIPTOR_RANGE(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2),        // t2
     };
 
-    CD3DX12_ROOT_PARAMETER param[6];
+    CD3DX12_DESCRIPTOR_RANGE shadowTable[] =
+    {
+        CD3DX12_DESCRIPTOR_RANGE(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3),        // t3
+    };
+
+    CD3DX12_ROOT_PARAMETER param[7];
     param[0].InitAsConstantBufferView(0);       // 0번 루트 시그니쳐에 b0 : CBV(개별 오브젝트 상수버퍼뷰)     레지스터 연결, 후 바인딩
     param[1].InitAsConstantBufferView(1);       // 1번 -> b1 : 개별 재질 CBV;
     param[2].InitAsConstantBufferView(2);       // 2번 -> b1 : 공용 CBV
     param[3].InitAsDescriptorTable(_countof(skyboxTable), skyboxTable);     // 3번 -> t0 : 스카이박스 텍스처
     param[4].InitAsDescriptorTable(_countof(texTable), texTable);       // 4번 -> t1 : 오브젝트 택스쳐
-    param[5].InitAsDescriptorTable(_countof(normalTable), normalTable);       // 5번 -> t1 : 노말 택스쳐
+    param[5].InitAsDescriptorTable(_countof(normalTable), normalTable);       // 5번 -> t2 : 노말 택스쳐
+    param[6].InitAsDescriptorTable(_countof(shadowTable), shadowTable);       // 6번 -> t3 : 그림자 맵 택스쳐
 
-    D3D12_STATIC_SAMPLER_DESC samplerDesc = CD3DX12_STATIC_SAMPLER_DESC(0);         // s0 : 샘플러
-    D3D12_ROOT_SIGNATURE_DESC sigDesc = CD3DX12_ROOT_SIGNATURE_DESC(_countof(param), param, 1, &samplerDesc);       // 매핑
+    const CD3DX12_STATIC_SAMPLER_DESC pointWrap(
+        0,     // s0 : 기본 텍스쳐 샘플러
+        D3D12_FILTER_MIN_MAG_MIP_POINT,     // filter
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,        // U
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,        // V
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP);      // W
+
+    const CD3DX12_STATIC_SAMPLER_DESC shadow(
+        1,     // s1 : 그림자 맵 텍스쳐 샘플러
+        D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,      // U
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,      // V
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,      // W
+        0.0f,
+        16,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK);
+
+    std::array<const CD3DX12_STATIC_SAMPLER_DESC, 2> staticSamplers = { pointWrap, shadow };
+
+    D3D12_ROOT_SIGNATURE_DESC sigDesc = CD3DX12_ROOT_SIGNATURE_DESC(_countof(param), param, (UINT)staticSamplers.size(), staticSamplers.data());       // 매핑
     sigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ComPtr<ID3DBlob> blobSignature;     // blob 는 파일을 만들어서 
@@ -1244,4 +1535,37 @@ void InitDirect3DApp::BuildPSO()
     skyPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     skyPsoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&skyPsoDesc, IID_PPV_ARGS(&mPSOs["skybox"])));
+
+    // Shadow map
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowPsoDesc = psoDesc;
+    shadowPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["shadowVS"]->GetBufferPointer()),
+        mShaders["shadowVS"]->GetBufferSize()
+    };
+    shadowPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["shadowPS"]->GetBufferPointer()),
+        mShaders["shadowPS"]->GetBufferSize()
+    };
+    shadowPsoDesc.RasterizerState.DepthBias = 100000;
+    shadowPsoDesc.RasterizerState.DepthBiasClamp = 0.0f;
+    shadowPsoDesc.RasterizerState.SlopeScaledDepthBias = 1.0f;
+    shadowPsoDesc.NumRenderTargets = 0;
+    shadowPsoDesc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowPsoDesc, IID_PPV_ARGS(&mPSOs["shadow"])));
+
+    // ShadowDebug
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC debugPsoDesc = psoDesc;
+    debugPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["debugVS"]->GetBufferPointer()),
+        mShaders["debugVS"]->GetBufferSize()
+    };
+    debugPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["debugPS"]->GetBufferPointer()),
+        mShaders["debugPS"]->GetBufferSize()
+    };
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&debugPsoDesc, IID_PPV_ARGS(&mPSOs["debug"])));
 }
